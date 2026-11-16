@@ -28,11 +28,20 @@ jobs:
         with:
           gradle-version: 8.9
 
-      - name: Refresh blocklist (keeps the committed list if the download fails)
+      - name: Refresh filter lists (keeps the committed ones if anything fails)
         run: |
-          curl -fsSL https://raw.githubusercontent.com/anudeepND/blacklist/master/adservers.txt -o /tmp/hosts.txt || exit 0
-          grep -E '^0\.0\.0\.0 ' /tmp/hosts.txt | awk '{print tolower($2)}' | grep -vE '^(0\.0\.0\.0|localhost)$' | sort -u > /tmp/blocklist.txt
-          if [ "$(wc -l < /tmp/blocklist.txt)" -gt 10000 ]; then cp /tmp/blocklist.txt app/src/main/assets/blocklist.txt; fi
+          mkdir -p /tmp/l /tmp/out
+          cp app/src/main/assets/blocklist.txt /tmp/out/
+          RAW=https://raw.githubusercontent.com
+          if curl -fsSL $RAW/easylist/easylist/gh-pages/easylist.txt -o /tmp/l/easylist.txt \
+             && curl -fsSL $RAW/easylist/easylist/gh-pages/easyprivacy.txt -o /tmp/l/easyprivacy.txt \
+             && curl -fsSL $RAW/uBlockOrigin/uAssets/master/filters/filters.txt -o /tmp/l/ubo.txt \
+             && curl -fsSL $RAW/anudeepND/blacklist/master/adservers.txt -o /tmp/l/hosts.txt \
+             && python3 tools/build_filters.py /tmp/out --hosts /tmp/l/hosts.txt /tmp/l/easylist.txt /tmp/l/easyprivacy.txt /tmp/l/ubo.txt; then
+            if [ "$(wc -l < /tmp/out/blocklist.txt)" -gt 50000 ] && [ "$(wc -l < /tmp/out/net_rules.txt)" -gt 1000 ]; then
+              cp /tmp/out/*.txt app/src/main/assets/
+            fi
+          fi
 
       - name: Build release APK
         run: gradle :app:assembleRelease --no-daemon
