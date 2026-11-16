@@ -3,15 +3,24 @@ package com.feather.browser
 import android.app.Activity
 import android.app.AlertDialog
 import android.app.DownloadManager
+import android.app.KeyguardManager
 import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.pm.ShortcutInfo
+import android.content.pm.ShortcutManager
 import android.content.res.ColorStateList
 import android.content.res.Configuration
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.drawable.Icon
+import android.hardware.biometrics.BiometricManager
+import android.hardware.biometrics.BiometricPrompt
+import android.os.CancellationSignal
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.net.http.SslError
@@ -55,6 +64,7 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.ProgressBar
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
@@ -63,6 +73,7 @@ import androidx.webkit.ScriptHandler
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import java.io.ByteArrayInputStream
+import org.json.JSONObject
 import java.net.URLEncoder
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -81,6 +92,9 @@ class MainActivity : Activity() {
         var pending: String? = null
         var priv = false
         var scriptHandler: ScriptHandler? = null
+        var thumb: Bitmap? = null
+        var group = ""
+        var desktopApplied = false
     }
 
     private class IconBtn(val frame: FrameLayout, val img: ImageView, val badge: TextView)
@@ -108,6 +122,10 @@ class MainActivity : Activity() {
     private var pendingPermission: PermissionRequest? = null
     private var pendingGeo: Pair<String, GeolocationPermissions.Callback>? = null
     private var fieldColor = 0
+    private lateinit var lockView: FrameLayout
+    private var needLock = false
+    private var skipNextLock = false
+    private var unlocking = false
     private lateinit var urlRow: LinearLayout
     private lateinit var navRow: LinearLayout
     private lateinit var progressBar: ProgressBar
@@ -135,6 +153,10 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         prefs = Prefs(this)
         blocker = AdBlocker(this)
+        blocker.extraEnabled = prefs.extraFilters
+        blocker.onLoaded = { ui.post { for (t in tabs) refreshScripts(t) } }
+        blocker.start()
+        needLock = prefs.appLock
         totalBlocked.set(prefs.totalBlocked)
 
         // A previous session that was killed before it could wipe its data gets wiped now.
@@ -154,7 +176,7 @@ class MainActivity : Activity() {
 
         if (prefs.restoreTabs && !prefs.clearOnExit) {
             val (saved, idx) = prefs.loadSession()
-            saved.forEachIndexed { i, (title, url) -> newTab(url, select = i == idx.coerceIn(0, saved.size - 1), title = title) }
+            saved.forEachIndexed { i, (title, url, group) -> newTab(url, select = i == idx.coerceIn(0, saved.size - 1), title = title, group = group) }
         } else {
             prefs.clearSession()
         }
@@ -186,7 +208,7 @@ class MainActivity : Activity() {
         if (prefs.restoreTabs && !prefs.clearOnExit) {
             val open = tabs.filter { !it.priv && !isBlankUrl(it.url.ifEmpty { it.pending ?: "" }) }
             val idx = open.indexOf(current).coerceAtLeast(0)
-            prefs.saveSession(open.map { tabLabel(it) to it.url.ifEmpty { it.pending ?: "" } }, idx)
+            prefs.saveSession(open.map { Triple(tabLabel(it), it.url.ifEmpty { it.pending ?: "" }, it.group) }, idx)
         } else {
             prefs.clearSession()
         }
@@ -195,6 +217,20 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         current?.web?.onResume()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        if (skipNextLock) {
+            skipNextLock = false
+        } else if (prefs.appLock && needLock) {
+            showLock()
+        }
+    }
+
+    override fun onStop() {
+        super.onStop()
+        if (prefs.appLock && !unlocking) needLock = true
     }
 
     override fun onDestroy() {
@@ -214,6 +250,10 @@ class MainActivity : Activity() {
 
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
+        if (lockView.visibility == View.VISIBLE) {
+            moveTaskToBack(true)
+            return
+        }
         if (customView != null) {
             hideCustomView()
             return
@@ -242,6 +282,10 @@ class MainActivity : Activity() {
         if (requestCode == REQ_FILE) {
             fileCallback?.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(resultCode, data))
             fileCallback = null
+        } else if (requestCode == REQ_EXPORT && resultCode == RESULT_OK) {
+            data?.data?.let { exportBookmarks(it) }
+        } else if (requestCode == REQ_IMPORT && resultCode == RESULT_OK) {
+            data?.data?.let { importBookmarks(it) }
         } else {
             @Suppress("DEPRECATION")
             super.onActivityResult(requestCode, resultCode, data)
@@ -408,6 +452,24 @@ class MainActivity : Activity() {
 
         outer.addView(browser, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         outer.addView(fullscreenFrame, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        lockView = FrameLayout(this)
+        lockView.visibility = View.GONE
+        lockView.isClickable = true
+        val lockBox = LinearLayout(this)
+        lockBox.orientation = LinearLayout.VERTICAL
+        lockBox.gravity = Gravity.CENTER
+        val lockTitle = TextView(this)
+        lockTitle.text = "Feather is locked"
+        lockTitle.textSize = 22f
+        lockTitle.gravity = Gravity.CENTER
+        lockTitle.tag = "lock_title"
+        val unlockBtn = android.widget.Button(this)
+        unlockBtn.text = "Unlock"
+        unlockBtn.setOnClickListener { authenticate() }
+        lockBox.addView(lockTitle)
+        lockBox.addView(unlockBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(20) })
+        lockView.addView(lockBox, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
+        outer.addView(lockView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         setContentView(outer)
 
         if (Build.VERSION.SDK_INT >= 30) {
@@ -441,6 +503,8 @@ class MainActivity : Activity() {
         subtleColor = if (night) 0xFF8C8C96.toInt() else 0xFF6B6B75.toInt()
 
         browser.setBackgroundColor(bar)
+        lockView.setBackgroundColor(bar)
+        (lockView.findViewWithTag<TextView>("lock_title"))?.setTextColor(textColor)
         val bg = GradientDrawable()
         bg.cornerRadius = dp(22).toFloat()
         bg.setColor(field)
@@ -475,7 +539,7 @@ class MainActivity : Activity() {
         val bg = urlField.background as? GradientDrawable
         bg?.setColor(if (tab.priv) (if (night) 0xFF3A2A55.toInt() else 0xFFE2D6F5.toInt()) else fieldColor)
         urlField.hint = if (tab.priv) "Private tab - search or enter address" else "Search or enter address"
-        if (tab.priv) window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        if (tab.priv || prefs.appLock) window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
         else window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
 
         progressBar.visibility = if (tab.progress in 0..99) View.VISIBLE else View.GONE
@@ -515,7 +579,7 @@ class MainActivity : Activity() {
 
     private fun privateSupported() = WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE)
 
-    private fun newTab(url: String?, select: Boolean = true, title: String = "", private: Boolean = false) {
+    private fun newTab(url: String?, select: Boolean = true, title: String = "", private: Boolean = false, group: String = "") {
         if (private && !privateSupported()) {
             toast("Private tabs need a newer Android System WebView")
             return
@@ -523,6 +587,7 @@ class MainActivity : Activity() {
         val web = WebView(this)
         val tab = Tab(web)
         tab.priv = private
+        tab.group = group
         configure(tab)
         tabs.add(tab)
         if (select) {
@@ -547,6 +612,7 @@ class MainActivity : Activity() {
     }
 
     private fun selectTab(tab: Tab) {
+        current?.let { if (it !== tab) captureThumb(it) }
         current?.web?.onPause()
         webHost.removeAllViews()
         (tab.web.parent as? ViewGroup)?.removeView(tab.web)
@@ -644,6 +710,7 @@ class MainActivity : Activity() {
                 url = "https://" + url.removePrefix("http://")
             }
         }
+        applySiteSettings(tab, Uri.parse(url).host)
         tab.web.loadUrl(url, mapOf("Sec-GPC" to "1", "DNT" to "1"))
     }
 
@@ -740,6 +807,7 @@ class MainActivity : Activity() {
                             }
                         }
                         val host = url.host
+                        applySiteSettings(tab, host)
                         if (prefs.httpsOnly && url.scheme == "http" && host != null &&
                             !isLocalHost(host) && !isHttpOk(host)
                         ) {
@@ -766,12 +834,14 @@ class MainActivity : Activity() {
                 if (!prefs.blockAds) return null
                 val page = tab.pageHost
                 if (page != null && prefs.isAllowed(page)) return null
-                if (blocker.isBlocked(host) || blocker.isBlockedUrl(request.url, page)) {
+                if (blocker.shouldBlock(request.url, page)) {
                     tab.blocked.incrementAndGet()
                     totalBlocked.incrementAndGet()
                     if (!uiPending.getAndSet(true)) ui.postDelayed(blockedRunnable, 400)
+                    // YouTube ad pings get a normal-looking empty answer (an error makes its player stall and retry)
+                    val yt = blocker.isYoutubeAdEndpoint(request.url)
                     return WebResourceResponse(
-                        "text/plain", "utf-8", 403, "Blocked", emptyMap(),
+                        "text/plain", "utf-8", if (yt) 200 else 403, if (yt) "OK" else "Blocked", emptyMap(),
                         ByteArrayInputStream(ByteArray(0))
                     )
                 }
@@ -851,6 +921,7 @@ class MainActivity : Activity() {
             ): Boolean {
                 fileCallback?.onReceiveValue(null)
                 fileCallback = filePathCallback
+                skipNextLock = true
                 return try {
                     @Suppress("DEPRECATION")
                     startActivityForResult(fileChooserParams.createIntent(), REQ_FILE)
@@ -883,8 +954,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun applyDark(web: WebView) {
-        val on = prefs.darkPages
+    private fun applyDark(web: WebView, on: Boolean = prefs.darkPages) {
         if (Build.VERSION.SDK_INT >= 33) {
             web.settings.isAlgorithmicDarkeningAllowed = on
         } else {
@@ -893,24 +963,53 @@ class MainActivity : Activity() {
         }
     }
 
+    /** Applies global + per-site JavaScript, desktop-site and dark-page settings before a page loads. */
+    private fun applySiteSettings(tab: Tab, host: String?) {
+        val st = tab.web.settings
+        val js = when (if (host != null) prefs.siteJs(host) else 0) {
+            1 -> true
+            2 -> false
+            else -> !prefs.blockJs
+        }
+        if (st.javaScriptEnabled != js) st.javaScriptEnabled = js
+        val desktop = tab.desktop || (host != null && prefs.siteDesktop(host))
+        if (desktop != tab.desktopApplied) {
+            tab.desktopApplied = desktop
+            st.userAgentString = if (desktop) desktopUa else mobileUa
+            st.useWideViewPort = desktop
+            st.loadWithOverviewMode = desktop
+        }
+        applyDark(tab.web, prefs.darkPages || (host != null && prefs.siteDark(host)))
+    }
+
     private fun injectCosmetic(tab: Tab, view: WebView) {
-        if (!prefs.blockAds || prefs.blockJs) return
-        if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) return // handled earlier by the document-start script
+        if (!prefs.blockAds || !view.settings.javaScriptEnabled) return
         val host = tab.pageHost
         if (host != null && prefs.isAllowed(host)) return
-        if (isBlankUrl(tab.url)) return
-        view.evaluateJavascript(AdBlocker.COSMETIC_JS, null)
+        if (isBlankUrl(tab.url) || host == null) return
+        val css = blocker.domainCss(host)
+        if (css.isNotEmpty()) {
+            view.evaluateJavascript(
+                "(function(){var s=document.getElementById('__fb_dom');if(!s){s=document.createElement('style');" +
+                    "s.id='__fb_dom';(document.head||document.documentElement).appendChild(s);}s.textContent=" +
+                    JSONObject.quote(css) + ";})();", null
+            )
+        }
+        if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+            view.evaluateJavascript(AdBlocker.COSMETIC_JS, null)
+        }
     }
 
     /** (Re)installs the document-start script; call after anything that changes what it should do. */
     private fun refreshScripts(tab: Tab) {
         tab.scriptHandler?.remove()
         tab.scriptHandler = null
-        if (!prefs.blockAds || prefs.blockJs) return
+        if (!prefs.blockAds) return
         if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) return
         try {
+            val generic = if (prefs.extraFilters) blocker.genericCss else ""
             tab.scriptHandler = WebViewCompat.addDocumentStartJavaScript(
-                tab.web, AdBlocker.documentStartScript(prefs.allowedHosts()), setOf("*")
+                tab.web, AdBlocker.documentStartScript(prefs.allowedHosts(), generic, prefs.cookieBanners), setOf("*")
             )
         } catch (_: Exception) {
         }
@@ -1116,7 +1215,8 @@ class MainActivity : Activity() {
         rows: MutableList<Row>,
         onPick: (Int) -> Unit,
         onRemove: (Int) -> Unit,
-        emptyText: String? = null
+        emptyText: String? = null,
+        extra: List<Pair<String, () -> Unit>> = emptyList()
     ) {
         val lv = ListView(this)
         lateinit var dialog: AlertDialog
@@ -1168,20 +1268,147 @@ class MainActivity : Activity() {
         }
         val b = AlertDialog.Builder(this).setTitle(title)
         if (rows.isEmpty() && emptyText != null) b.setMessage(emptyText) else b.setView(lv)
-        dialog = b.setNegativeButton("Close", null).create()
+        b.setNegativeButton("Close", null)
+        extra.getOrNull(0)?.let { (label, act) -> b.setPositiveButton(label) { _, _ -> act() } }
+        extra.getOrNull(1)?.let { (label, act) -> b.setNeutralButton(label) { _, _ -> act() } }
+        dialog = b.create()
         dialog.show()
     }
 
-    private fun showTabs() {
-        val rows = tabs.map { Row(tabLabel(it), if (isBlankUrl(it.url)) null else displayUrl(it.url)) }.toMutableList()
-        showList(
-            "Tabs (${tabs.size})", rows,
-            onPick = { selectTab(tabs[it]) },
-            onRemove = { idx ->
-                rows.removeAt(idx)
-                closeTab(tabs[idx])
+    private fun captureThumb(tab: Tab) {
+        if (tab.priv) return
+        val w = tab.web.width
+        val h = tab.web.height
+        if (w <= 0 || h <= 0) return
+        try {
+            val scale = 0.25f
+            val bmp = Bitmap.createBitmap(
+                (w * scale).toInt().coerceAtLeast(1), (h * scale).toInt().coerceAtLeast(1), Bitmap.Config.RGB_565
+            )
+            val c = Canvas(bmp)
+            c.scale(scale, scale)
+            tab.web.draw(c)
+            tab.thumb = bmp
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun groupMenu(t: Tab, after: () -> Unit) {
+        val existing = tabs.map { it.group }.filter { it.isNotEmpty() }.distinct()
+        val labels = ArrayList<String>()
+        for (g in existing) labels.add("Move to \"$g\"")
+        labels.add("New group...")
+        if (t.group.isNotEmpty()) labels.add("Remove from group")
+        AlertDialog.Builder(this).setItems(labels.toTypedArray()) { _, which ->
+            when {
+                which < existing.size -> { t.group = existing[which]; after() }
+                which == existing.size -> {
+                    val et = EditText(this)
+                    et.setSingleLine()
+                    et.hint = "Group name"
+                    AlertDialog.Builder(this).setTitle("New group").setView(et)
+                        .setPositiveButton("Create") { _, _ -> t.group = et.text.toString().trim().take(24); after() }
+                        .setNegativeButton("Cancel", null).show()
+                }
+                else -> { t.group = ""; after() }
             }
-        )
+        }.show()
+    }
+
+    private fun showTabs() {
+        current?.let { captureThumb(it) }
+        val scroll = ScrollView(this)
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        col.setPadding(dp(8), dp(8), dp(8), dp(8))
+        scroll.addView(col)
+        lateinit var dialog: AlertDialog
+
+        fun render() {
+            col.removeAllViews()
+            val hint = TextView(this)
+            hint.text = "${tabs.size} tabs. Long-press a tab to put it in a group."
+            hint.textSize = 12f
+            hint.alpha = 0.6f
+            hint.setPadding(dp(4), 0, dp(4), dp(4))
+            col.addView(hint)
+            val groups = tabs.map { it.group }.distinct().sortedWith(compareBy({ it.isNotEmpty() }, { it.lowercase() }))
+            for (g in groups) {
+                if (g.isNotEmpty()) {
+                    val head = TextView(this)
+                    head.text = g
+                    head.textSize = 14f
+                    head.setTypeface(head.typeface, android.graphics.Typeface.BOLD)
+                    head.setTextColor(ACCENT)
+                    head.setPadding(dp(4), dp(12), dp(4), dp(2))
+                    col.addView(head)
+                }
+                val members = tabs.filter { it.group == g }
+                var i = 0
+                while (i < members.size) {
+                    val row = LinearLayout(this)
+                    for (j in 0..1) {
+                        val t = members.getOrNull(i + j)
+                        val lp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                        lp.setMargins(dp(4), dp(4), dp(4), dp(4))
+                        if (t == null) { row.addView(View(this), lp); continue }
+                        val card = LinearLayout(this)
+                        card.orientation = LinearLayout.VERTICAL
+                        val bg = GradientDrawable()
+                        bg.cornerRadius = dp(10).toFloat()
+                        bg.setColor(fieldColor)
+                        if (t === current) bg.setStroke(dp(2), ACCENT)
+                        card.background = bg
+                        card.clipToOutline = true
+                        val frame = FrameLayout(this)
+                        val img = ImageView(this)
+                        img.scaleType = ImageView.ScaleType.CENTER_CROP
+                        val th = t.thumb
+                        if (th != null) img.setImageBitmap(th)
+                        frame.addView(img, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(120)))
+                        if (th == null) {
+                            val ph = TextView(this)
+                            ph.text = if (t.priv) "Private" else ""
+                            ph.gravity = Gravity.CENTER
+                            ph.setTextColor(subtleColor)
+                            frame.addView(ph, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(120)))
+                        }
+                        val x = TextView(this)
+                        x.text = "✕"
+                        x.textSize = 14f
+                        x.setTextColor(0xFFFFFFFF.toInt())
+                        x.gravity = Gravity.CENTER
+                        val xb = GradientDrawable()
+                        xb.shape = GradientDrawable.OVAL
+                        xb.setColor(0x99000000.toInt())
+                        x.background = xb
+                        x.setOnClickListener { closeTab(t); render() }
+                        frame.addView(x, FrameLayout.LayoutParams(dp(28), dp(28), Gravity.TOP or Gravity.END).apply { setMargins(0, dp(6), dp(6), 0) })
+                        card.addView(frame)
+                        val title = TextView(this)
+                        title.text = tabLabel(t)
+                        title.textSize = 12f
+                        title.maxLines = 2
+                        title.ellipsize = android.text.TextUtils.TruncateAt.END
+                        title.setPadding(dp(8), dp(6), dp(8), dp(8))
+                        card.addView(title)
+                        card.setOnClickListener { dialog.dismiss(); selectTab(t) }
+                        card.setOnLongClickListener { groupMenu(t) { render() }; true }
+                        row.addView(card, lp)
+                    }
+                    col.addView(row)
+                    i += 2
+                }
+            }
+        }
+        render()
+        dialog = AlertDialog.Builder(this)
+            .setView(scroll)
+            .setPositiveButton("New tab") { _, _ -> newTab(null); focusUrlBar() }
+            .setNeutralButton("Private") { _, _ -> newTab(null, private = true); if (current?.priv == true) focusUrlBar() }
+            .setNegativeButton("Close", null)
+            .create()
+        dialog.show()
     }
 
     private fun showBookmarks() {
@@ -1195,7 +1422,8 @@ class MainActivity : Activity() {
                 rows.removeAt(idx)
                 prefs.saveBookmarks(list)
             },
-            emptyText = "No bookmarks yet. Use the menu to bookmark a page."
+            emptyText = "No bookmarks yet. Use the menu to bookmark a page.",
+            extra = listOf("Import" to { importPick() }, "Export" to { exportPick() })
         )
     }
 
@@ -1209,6 +1437,7 @@ class MainActivity : Activity() {
         items.add("New tab"); actions.add { newTab(null); focusUrlBar() }
         items.add("New private tab"); actions.add { newTab(null, private = true); if (current?.priv == true) focusUrlBar() }
         if (hasPage) { items.add("Find in page"); actions.add { showFind() } }
+        if (hasPage) { items.add("Reader view"); actions.add { showReader() } }
         if (hasPage) {
             items.add("Bookmark this page"); actions.add {
                 val l = prefs.bookmarks()
@@ -1221,19 +1450,19 @@ class MainActivity : Activity() {
         }
         items.add("Bookmarks"); actions.add { showBookmarks() }
         if (hasPage) {
+            items.add("Add to home screen"); actions.add { pinShortcut(tab) }
             items.add("Share link"); actions.add { share(tab.url) }
             items.add("Copy link"); actions.add { copy(tab.url) }
         }
         items.add(if (tab.desktop) "Mobile site" else "Desktop site"); actions.add {
             tab.desktop = !tab.desktop
-            tab.web.settings.userAgentString = if (tab.desktop) desktopUa else mobileUa
-            tab.web.settings.useWideViewPort = tab.desktop
-            tab.web.settings.loadWithOverviewMode = tab.desktop
+            applySiteSettings(tab, host)
             if (hasPage) tab.web.reload()
         }
         if (hasPage && host != null) {
             items.add(if (siteOn) "Turn off ad blocking for this site" else "Turn on ad blocking for this site")
             actions.add { toggleSite(tab, host) }
+            items.add("Site settings"); actions.add { showSiteSettings(tab) }
         }
         items.add("Downloads"); actions.add {
             try { startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)) } catch (_: ActivityNotFoundException) { toast("No downloads app found") }
@@ -1251,6 +1480,178 @@ class MainActivity : Activity() {
         for (t in tabs) refreshScripts(t)
         tab.web.reload()
         updateUi()
+    }
+
+    // ---------------------------------------------------------------- bookmarks import / export
+
+    private fun exportPick() {
+        skipNextLock = true
+        val i = Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
+            .setType("text/html").putExtra(Intent.EXTRA_TITLE, "feather-bookmarks.html")
+        @Suppress("DEPRECATION")
+        startActivityForResult(i, REQ_EXPORT)
+    }
+
+    private fun importPick() {
+        skipNextLock = true
+        val i = Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*")
+        @Suppress("DEPRECATION")
+        startActivityForResult(i, REQ_IMPORT)
+    }
+
+    private fun htmlAttr(s: String) = escapeHtml(s).replace("\"", "&quot;")
+
+    private fun exportBookmarks(uri: Uri) {
+        try {
+            val list = prefs.bookmarks()
+            val sb = StringBuilder("<!DOCTYPE NETSCAPE-Bookmark-file-1>\n")
+            sb.append("<META HTTP-EQUIV=\"Content-Type\" CONTENT=\"text/html; charset=UTF-8\">\n<TITLE>Bookmarks</TITLE>\n<H1>Bookmarks</H1>\n<DL><p>\n")
+            for ((t, u) in list) sb.append("    <DT><A HREF=\"").append(htmlAttr(u)).append("\">").append(escapeHtml(t)).append("</A>\n")
+            sb.append("</DL><p>\n")
+            contentResolver.openOutputStream(uri)?.use { it.write(sb.toString().toByteArray(Charsets.UTF_8)) }
+            toast("Exported ${list.size} bookmarks")
+        } catch (_: Exception) {
+            toast("Couldn't export bookmarks")
+        }
+    }
+
+    private fun importBookmarks(uri: Uri) {
+        try {
+            val text = contentResolver.openInputStream(uri)?.use { it.readBytes().take(5_000_000).toByteArray().toString(Charsets.UTF_8) } ?: return
+            val list = prefs.bookmarks()
+            val known = list.map { it.second }.toHashSet()
+            val re = Regex("<A\\s[^>]*?HREF=\"([^\"]+)\"[^>]*>(.*?)</A>", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
+            var added = 0
+            for (m in re.findAll(text)) {
+                val url = unescapeHtml(m.groupValues[1].trim())
+                if (!(url.startsWith("http://") || url.startsWith("https://")) || !known.add(url)) continue
+                val title = unescapeHtml(m.groupValues[2].replace(Regex("<[^>]*>"), "").trim()).ifEmpty { displayUrl(url) }
+                list.add(title to url)
+                if (++added >= 5000) break
+            }
+            prefs.saveBookmarks(list)
+            toast("Imported $added bookmarks")
+        } catch (_: Exception) {
+            toast("Couldn't import that file")
+        }
+    }
+
+    private fun unescapeHtml(s: String) =
+        s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'").replace("&amp;", "&")
+
+    // ---------------------------------------------------------------- per-site settings, reader, shortcuts
+
+    private fun showSiteSettings(tab: Tab) {
+        val host = tab.pageHost ?: return
+        val js = prefs.siteJs(host)
+        val items = arrayOf(
+            "JavaScript: " + when (js) {
+                1 -> "always on"
+                2 -> "always off"
+                else -> if (prefs.blockJs) "off (default)" else "on (default)"
+            },
+            "Desktop site: " + if (prefs.siteDesktop(host)) "always" else "default",
+            "Dark pages: " + if (prefs.siteDark(host)) "always" else "default",
+            "Ad blocking: " + if (prefs.isAllowed(host)) "off for this site" else "on"
+        )
+        AlertDialog.Builder(this)
+            .setTitle(host)
+            .setItems(items) { _, which ->
+                when (which) {
+                    0 -> prefs.setSite(host, "js", (js + 1) % 3)
+                    1 -> prefs.setSite(host, "desktop", !prefs.siteDesktop(host))
+                    2 -> prefs.setSite(host, "dark", !prefs.siteDark(host))
+                    3 -> toggleSite(tab, host)
+                }
+                if (which != 3) {
+                    applySiteSettings(tab, host)
+                    tab.web.reload()
+                }
+                showSiteSettings(tab)
+            }
+            .setNegativeButton("Done", null)
+            .show()
+    }
+
+    private fun showReader() {
+        val tab = current ?: return
+        if (!tab.web.settings.javaScriptEnabled) {
+            toast("Reader view needs JavaScript on this page")
+            return
+        }
+        tab.web.evaluateJavascript(READER_JS) { r ->
+            if (r == null || r.contains("fail")) toast("Couldn't find an article on this page")
+        }
+    }
+
+    private fun pinShortcut(tab: Tab) {
+        val sm = getSystemService(ShortcutManager::class.java)
+        if (sm == null || !sm.isRequestPinShortcutSupported) {
+            toast("Your launcher can't pin shortcuts")
+            return
+        }
+        val url = tab.url
+        val size = 432
+        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val c = Canvas(bmp)
+        c.drawColor(ACCENT)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        paint.color = 0xFFFFFFFF.toInt()
+        paint.textSize = 170f
+        paint.textAlign = Paint.Align.CENTER
+        paint.typeface = android.graphics.Typeface.DEFAULT_BOLD
+        val letter = (tab.pageHost?.removePrefix("www.")?.firstOrNull() ?: 'F').uppercaseChar().toString()
+        c.drawText(letter, size / 2f, size / 2f - (paint.descent() + paint.ascent()) / 2f, paint)
+        val launch = Intent(this, MainActivity::class.java).setAction(Intent.ACTION_VIEW).setData(Uri.parse(url))
+        val info = ShortcutInfo.Builder(this, "site_" + url.hashCode())
+            .setShortLabel(tabLabel(tab).take(24))
+            .setIcon(Icon.createWithAdaptiveBitmap(bmp))
+            .setIntent(launch)
+            .build()
+        sm.requestPinShortcut(info, null)
+    }
+
+    // ---------------------------------------------------------------- app lock
+
+    private fun showLock() {
+        val km = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+        if (!km.isDeviceSecure) {
+            prefs.appLock = false
+            needLock = false
+            return
+        }
+        lockView.visibility = View.VISIBLE
+        hideKeyboard()
+        authenticate()
+    }
+
+    private fun authenticate() {
+        unlocking = true
+        try {
+            val b = BiometricPrompt.Builder(this).setTitle("Unlock Feather")
+            if (Build.VERSION.SDK_INT >= 30) {
+                b.setAllowedAuthenticators(
+                    BiometricManager.Authenticators.BIOMETRIC_STRONG or BiometricManager.Authenticators.DEVICE_CREDENTIAL
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                b.setDeviceCredentialAllowed(true)
+            }
+            b.build().authenticate(CancellationSignal(), mainExecutor, object : BiometricPrompt.AuthenticationCallback() {
+                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                    unlocking = false
+                    needLock = false
+                    lockView.visibility = View.GONE
+                }
+
+                override fun onAuthenticationError(errorCode: Int, errString: CharSequence?) {
+                    unlocking = false
+                }
+            })
+        } catch (e: Exception) {
+            unlocking = false
+            toast("Can't show the unlock screen")
+        }
     }
 
     private fun showHttpExceptions() {
@@ -1295,15 +1696,18 @@ class MainActivity : Activity() {
             "Block JavaScript (strict, breaks many sites)",
             "Dark pages (when system is dark)",
             "Clear all data when Feather closes",
-            "Restore tabs on start"
+            "Restore tabs on start",
+            "Extra filter lists (EasyList, EasyPrivacy, uBO)",
+            "Hide and decline cookie banners",
+            "Lock Feather (fingerprint or screen lock)"
         )
         val checked = booleanArrayOf(
             prefs.blockAds, prefs.httpsOnly, prefs.stripTracking, prefs.blockJs, prefs.darkPages, prefs.clearOnExit,
-            prefs.restoreTabs
+            prefs.restoreTabs, prefs.extraFilters, prefs.cookieBanners, prefs.appLock
         )
         AlertDialog.Builder(this)
             .setTitle("Settings")
-            .setMultiChoiceItems(labels, checked) { _, which, on ->
+            .setMultiChoiceItems(labels, checked) { d, which, on ->
                 when (which) {
                     0 -> prefs.blockAds = on
                     1 -> prefs.httpsOnly = on
@@ -1312,10 +1716,21 @@ class MainActivity : Activity() {
                     4 -> prefs.darkPages = on
                     5 -> { prefs.clearOnExit = on; prefs.pendingClear = on }
                     6 -> prefs.restoreTabs = on
+                    7 -> { prefs.extraFilters = on; blocker.extraEnabled = on }
+                    8 -> prefs.cookieBanners = on
+                    9 -> {
+                        val km = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+                        if (on && !km.isDeviceSecure) {
+                            toast("Set a screen lock in Android settings first")
+                            (d as AlertDialog).listView.setItemChecked(which, false)
+                        } else {
+                            prefs.appLock = on
+                            needLock = false
+                        }
+                    }
                 }
                 for (t in tabs) {
-                    t.web.settings.javaScriptEnabled = !prefs.blockJs
-                    applyDark(t.web)
+                    applySiteSettings(t, t.pageHost)
                     refreshScripts(t)
                 }
                 updateUi()
@@ -1358,7 +1773,30 @@ class MainActivity : Activity() {
 
     companion object {
         private const val REQ_FILE = 1001
+        private val READER_JS = """
+(function(){
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;');}
+var best=null,bs=0,els=document.querySelectorAll('article,main,[role=main],section,div,td');
+for(var i=0;i<els.length;i++){var el=els[i],s=0;
+for(var c=el.firstElementChild;c;c=c.nextElementSibling){if(c.tagName==='P'){var l=(c.innerText||'').length;if(l>60)s+=l;}}
+if(el.tagName==='ARTICLE')s*=1.5;if(s>bs){bs=s;best=el;}}
+if(!best||bs<200)return 'fail';
+var c=best.cloneNode(true);
+var rm=c.querySelectorAll('script,style,nav,aside,form,iframe,button,noscript,svg,video,audio,input,select,[aria-hidden=true],[class*=share],[class*=social],[class*=comment],[class*=related],[class*=newsletter],[id*=comment]');
+for(var j=0;j<rm.length;j++){if(rm[j].parentNode)rm[j].parentNode.removeChild(rm[j]);}
+var im=c.querySelectorAll('img');
+for(var k=0;k<im.length;k++){im[k].removeAttribute('width');im[k].removeAttribute('height');im[k].removeAttribute('style');im[k].removeAttribute('srcset');}
+var h1=document.querySelector('h1');var title=(h1&&h1.innerText)||document.title;
+var css=':root{color-scheme:light dark}body{max-width:680px;margin:0 auto;padding:20px 18px 60px;font:18px/1.65 Georgia,serif;background:Canvas;color:CanvasText}h1{font:700 28px/1.25 sans-serif}img,video{max-width:100%;height:auto}a{color:#4f8cff}pre{overflow:auto}';
+document.head.innerHTML='<meta name="viewport" content="width=device-width,initial-scale=1"><style>'+css+'</style>';
+document.body.removeAttribute('class');document.body.removeAttribute('style');
+document.body.innerHTML='<h1>'+esc(title)+'</h1>'+c.innerHTML;
+window.scrollTo(0,0);return 'ok';
+})()
+""".trimIndent()
         private const val REQ_MEDIA = 1002
+        private const val REQ_EXPORT = 1004
+        private const val REQ_IMPORT = 1005
         private const val REQ_GEO = 1003
         private const val PRIVATE_PROFILE = "private"
         private const val ACCENT = 0xFF4F8CFF.toInt()

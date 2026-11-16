@@ -33,24 +33,52 @@ class Prefs(context: Context) {
         get() = sp.getBoolean("dark_pages", false)
         set(v) = sp.edit().putBoolean("dark_pages", v).apply()
 
+    var extraFilters: Boolean
+        get() = sp.getBoolean("extra_filters", true)
+        set(v) = sp.edit().putBoolean("extra_filters", v).apply()
+
+    var cookieBanners: Boolean
+        get() = sp.getBoolean("cookie_banners", true)
+        set(v) = sp.edit().putBoolean("cookie_banners", v).apply()
+
+    var appLock: Boolean
+        get() = sp.getBoolean("app_lock", false)
+        set(v) = sp.edit().putBoolean("app_lock", v).apply()
+
+    // Per-site overrides: {"host": {"js": 0|1|2, "desktop": bool, "dark": bool}}  (js: 0 default, 1 on, 2 off)
+    private fun sites(): JSONObject = try { JSONObject(sp.getString("sites", "{}")) } catch (_: Exception) { JSONObject() }
+
+    fun siteJs(host: String): Int = sites().optJSONObject(host)?.optInt("js", 0) ?: 0
+    fun siteDesktop(host: String): Boolean = sites().optJSONObject(host)?.optBoolean("desktop", false) ?: false
+    fun siteDark(host: String): Boolean = sites().optJSONObject(host)?.optBoolean("dark", false) ?: false
+
+    fun setSite(host: String, key: String, value: Any) {
+        val all = sites()
+        val o = all.optJSONObject(host) ?: JSONObject()
+        o.put(key, value)
+        if (o.optInt("js", 0) == 0 && !o.optBoolean("desktop", false) && !o.optBoolean("dark", false)) all.remove(host)
+        else all.put(host, o)
+        sp.edit().putString("sites", all.toString()).apply()
+    }
+
     var restoreTabs: Boolean
         get() = sp.getBoolean("restore_tabs", false)
         set(v) = sp.edit().putBoolean("restore_tabs", v).apply()
 
     /** Open tabs as a JSON array of {t,u} plus the selected index; empty when nothing is saved. */
-    fun saveSession(tabs: List<Pair<String, String>>, index: Int) {
+    fun saveSession(tabs: List<Triple<String, String, String>>, index: Int) {
         val arr = JSONArray()
-        for ((t, u) in tabs) arr.put(JSONObject().put("t", t).put("u", u))
+        for ((t, u, g) in tabs) arr.put(JSONObject().put("t", t).put("u", u).put("g", g))
         sp.edit().putString("session", arr.toString()).putInt("session_index", index).apply()
     }
 
-    fun loadSession(): Pair<List<Pair<String, String>>, Int> {
-        val out = ArrayList<Pair<String, String>>()
+    fun loadSession(): Pair<List<Triple<String, String, String>>, Int> {
+        val out = ArrayList<Triple<String, String, String>>()
         try {
             val arr = JSONArray(sp.getString("session", "[]"))
             for (i in 0 until arr.length()) {
                 val o = arr.getJSONObject(i)
-                out.add(o.getString("t") to o.getString("u"))
+                out.add(Triple(o.getString("t"), o.getString("u"), o.optString("g", "")))
             }
         } catch (_: Exception) {
         }
