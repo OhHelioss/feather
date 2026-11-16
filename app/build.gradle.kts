@@ -43,3 +43,9 @@ android {
 
     lint { abortOnError = false }
 }
+
+dependencies {
+    // Only for per-tab profiles (private tabs) and document-start scripts; R8 strips what is unused.
+    implementation("androidx.webkit:webkit:1.12.1")
+    implementation("androidx.swiperefreshlayout:swiperefreshlayout:1.1.0")
+}

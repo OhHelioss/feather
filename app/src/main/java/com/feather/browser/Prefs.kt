@@ -33,6 +33,45 @@ class Prefs(context: Context) {
         get() = sp.getBoolean("dark_pages", false)
         set(v) = sp.edit().putBoolean("dark_pages", v).apply()
 
+    var restoreTabs: Boolean
+        get() = sp.getBoolean("restore_tabs", false)
+        set(v) = sp.edit().putBoolean("restore_tabs", v).apply()
+
+    /** Open tabs as a JSON array of {t,u} plus the selected index; empty when nothing is saved. */
+    fun saveSession(tabs: List<Pair<String, String>>, index: Int) {
+        val arr = JSONArray()
+        for ((t, u) in tabs) arr.put(JSONObject().put("t", t).put("u", u))
+        sp.edit().putString("session", arr.toString()).putInt("session_index", index).apply()
+    }
+
+    fun loadSession(): Pair<List<Pair<String, String>>, Int> {
+        val out = ArrayList<Pair<String, String>>()
+        try {
+            val arr = JSONArray(sp.getString("session", "[]"))
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                out.add(o.getString("t") to o.getString("u"))
+            }
+        } catch (_: Exception) {
+        }
+        return out to sp.getInt("session_index", 0)
+    }
+
+    fun clearSession() = sp.edit().remove("session").remove("session_index").apply()
+
+    // Sites the user chose to load over plain HTTP permanently
+    fun httpAllowed(): MutableList<String> = sp.getStringSet("http_ok", emptySet())!!.sorted().toMutableList()
+
+    fun isHttpAllowed(host: String): Boolean = sp.getStringSet("http_ok", emptySet())!!.contains(host)
+
+    fun setHttpAllowed(host: String, allowed: Boolean) {
+        val s = HashSet(sp.getStringSet("http_ok", emptySet())!!)
+        if (allowed) s.add(host) else s.remove(host)
+        sp.edit().putStringSet("http_ok", s).apply()
+    }
+
+    fun allowedHosts(): Set<String> = HashSet(sp.getStringSet("allow", emptySet())!!)
+
     /** True while a session is open and "clear on exit" has not run yet (covers killed processes). */
     var pendingClear: Boolean
         get() = sp.getBoolean("pending_clear", false)

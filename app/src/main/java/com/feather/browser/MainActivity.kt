@@ -8,6 +8,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.content.res.Configuration
 import android.graphics.Bitmap
@@ -20,6 +21,8 @@ import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.text.InputType
+import android.text.Editable
+import android.text.TextWatcher
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.KeyEvent
@@ -27,6 +30,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.WindowInsets
 import android.view.WindowInsetsController
+import android.view.WindowManager
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.webkit.CookieManager
@@ -53,6 +57,11 @@ import android.widget.ListView
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
+import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
+import androidx.webkit.ProfileStore
+import androidx.webkit.ScriptHandler
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
 import java.io.ByteArrayInputStream
 import java.net.URLEncoder
 import java.util.concurrent.atomic.AtomicBoolean
@@ -69,6 +78,9 @@ class MainActivity : Activity() {
         var desktop = false
         var upgradedFrom: String? = null
         var progress = 100
+        var pending: String? = null
+        var priv = false
+        var scriptHandler: ScriptHandler? = null
     }
 
     private class IconBtn(val frame: FrameLayout, val img: ImageView, val badge: TextView)
@@ -89,6 +101,13 @@ class MainActivity : Activity() {
     private lateinit var webHost: FrameLayout
     private lateinit var fullscreenFrame: FrameLayout
     private lateinit var urlField: EditText
+    private lateinit var swipe: SwipeRefreshLayout
+    private lateinit var findRow: LinearLayout
+    private lateinit var findField: EditText
+    private lateinit var findCount: TextView
+    private var pendingPermission: PermissionRequest? = null
+    private var pendingGeo: Pair<String, GeolocationPermissions.Callback>? = null
+    private var fieldColor = 0
     private lateinit var urlRow: LinearLayout
     private lateinit var navRow: LinearLayout
     private lateinit var progressBar: ProgressBar
@@ -131,10 +150,18 @@ class MainActivity : Activity() {
         buildUi()
         applyTheme()
 
+        deletePrivateProfile()
+
+        if (prefs.restoreTabs && !prefs.clearOnExit) {
+            val (saved, idx) = prefs.loadSession()
+            saved.forEachIndexed { i, (title, url) -> newTab(url, select = i == idx.coerceIn(0, saved.size - 1), title = title) }
+        } else {
+            prefs.clearSession()
+        }
         val data = intent?.data
         if (data != null && (data.scheme == "http" || data.scheme == "https")) {
             newTab(data.toString())
-        } else {
+        } else if (tabs.isEmpty()) {
             newTab(null)
         }
     }
@@ -156,6 +183,13 @@ class MainActivity : Activity() {
         current?.web?.onPause()
         prefs.totalBlocked = totalBlocked.get()
         CookieManager.getInstance().flush()
+        if (prefs.restoreTabs && !prefs.clearOnExit) {
+            val open = tabs.filter { !it.priv && !isBlankUrl(it.url.ifEmpty { it.pending ?: "" }) }
+            val idx = open.indexOf(current).coerceAtLeast(0)
+            prefs.saveSession(open.map { tabLabel(it) to it.url.ifEmpty { it.pending ?: "" } }, idx)
+        } else {
+            prefs.clearSession()
+        }
     }
 
     override fun onResume() {
@@ -173,6 +207,7 @@ class MainActivity : Activity() {
             t.web.destroy()
         }
         tabs.clear()
+        deletePrivateProfile()
         ui.removeCallbacksAndMessages(null)
         super.onDestroy()
     }
@@ -184,6 +219,10 @@ class MainActivity : Activity() {
             return
         }
         val tab = current
+        if (findRow.visibility == View.VISIBLE) {
+            hideFind()
+            return
+        }
         if (urlField.hasFocus()) {
             urlField.clearFocus()
             return
@@ -206,6 +245,21 @@ class MainActivity : Activity() {
         } else {
             @Suppress("DEPRECATION")
             super.onActivityResult(requestCode, resultCode, data)
+        }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        when (requestCode) {
+            REQ_MEDIA -> {
+                pendingPermission?.let { finishMediaGrant(it) }
+                pendingPermission = null
+            }
+            REQ_GEO -> {
+                val g = pendingGeo
+                pendingGeo = null
+                g?.second?.invoke(g.first, grantResults.any { it == PackageManager.PERMISSION_GRANTED }, false)
+            }
         }
     }
 
@@ -249,7 +303,52 @@ class MainActivity : Activity() {
         browser = LinearLayout(this)
         browser.orientation = LinearLayout.VERTICAL
         webHost = FrameLayout(this)
-        browser.addView(webHost, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        swipe = SwipeRefreshLayout(this)
+        swipe.addView(webHost, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        swipe.setColorSchemeColors(ACCENT)
+        swipe.setOnChildScrollUpCallback { _, _ -> (current?.web?.scrollY ?: 0) > 0 }
+        swipe.setOnRefreshListener {
+            swipe.isRefreshing = false
+            current?.web?.reload()
+        }
+        browser.addView(swipe, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+
+        findRow = LinearLayout(this)
+        findRow.gravity = Gravity.CENTER_VERTICAL
+        findRow.visibility = View.GONE
+        findRow.setPadding(dp(10), dp(4), dp(6), dp(4))
+        findField = EditText(this)
+        findField.setSingleLine()
+        findField.hint = "Find in page"
+        findField.textSize = 15f
+        findField.imeOptions = EditorInfo.IME_ACTION_SEARCH or EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING
+        findField.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, st: Int, c: Int, a: Int) {}
+            override fun onTextChanged(s: CharSequence?, st: Int, b: Int, c: Int) {}
+            override fun afterTextChanged(s: Editable?) {
+                val q = s?.toString() ?: ""
+                if (q.isEmpty()) { current?.web?.clearMatches(); findCount.text = "" } else current?.web?.findAllAsync(q)
+            }
+        })
+        findField.setOnEditorActionListener { _, _, _ -> current?.web?.findNext(true); true }
+        findCount = TextView(this)
+        findCount.textSize = 13f
+        findCount.setPadding(dp(8), 0, dp(8), 0)
+        fun findBtn(label: String, onClick: () -> Unit): TextView {
+            val t = TextView(this)
+            t.text = label
+            t.textSize = 20f
+            t.gravity = Gravity.CENTER
+            t.setPadding(dp(14), dp(8), dp(14), dp(8))
+            t.setOnClickListener { onClick() }
+            return t
+        }
+        findRow.addView(findField, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        findRow.addView(findCount)
+        findRow.addView(findBtn("▲") { current?.web?.findNext(false) })
+        findRow.addView(findBtn("▼") { current?.web?.findNext(true) })
+        findRow.addView(findBtn("✕") { hideFind() })
+        browser.addView(findRow, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
         progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
         progressBar.max = 100
@@ -337,6 +436,7 @@ class MainActivity : Activity() {
         night = (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
         val bar = if (night) 0xFF17171B.toInt() else 0xFFF4F4F7.toInt()
         val field = if (night) 0xFF2A2A31.toInt() else 0xFFE4E4EA.toInt()
+        fieldColor = field
         textColor = if (night) 0xFFE8E8EC.toInt() else 0xFF1B1B1F.toInt()
         subtleColor = if (night) 0xFF8C8C96.toInt() else 0xFF6B6B75.toInt()
 
@@ -347,6 +447,11 @@ class MainActivity : Activity() {
         urlField.background = bg
         urlField.setTextColor(textColor)
         urlField.setHintTextColor(subtleColor)
+        findField.setTextColor(textColor)
+        findField.setHintTextColor(subtleColor)
+        findCount.setTextColor(subtleColor)
+        for (i in 0 until findRow.childCount) (findRow.getChildAt(i) as? TextView)?.let { if (it !== findField) it.setTextColor(textColor) }
+        findCount.setTextColor(subtleColor)
         val tint = ColorStateList.valueOf(textColor)
         for (b in listOf(backBtn, fwdBtn, reloadBtn, shieldBtn, tabsBtn, menuBtn)) b.img.imageTintList = tint
         tabsBtn.badge.setTextColor(textColor)   // count sits inside the tabs outline
@@ -366,6 +471,12 @@ class MainActivity : Activity() {
         if (!urlField.hasFocus()) urlField.setText(displayUrl(tab.url))
         // Show the lock state with colour: red-ish text for plain HTTP
         urlField.setTextColor(if (tab.url.startsWith("http://")) 0xFFE5534B.toInt() else textColor)
+
+        val bg = urlField.background as? GradientDrawable
+        bg?.setColor(if (tab.priv) (if (night) 0xFF3A2A55.toInt() else 0xFFE2D6F5.toInt()) else fieldColor)
+        urlField.hint = if (tab.priv) "Private tab - search or enter address" else "Search or enter address"
+        if (tab.priv) window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        else window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
 
         progressBar.visibility = if (tab.progress in 0..99) View.VISIBLE else View.GONE
         progressBar.progress = tab.progress
@@ -402,13 +513,37 @@ class MainActivity : Activity() {
 
     // ---------------------------------------------------------------- tabs
 
-    private fun newTab(url: String?, select: Boolean = true) {
+    private fun privateSupported() = WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE)
+
+    private fun newTab(url: String?, select: Boolean = true, title: String = "", private: Boolean = false) {
+        if (private && !privateSupported()) {
+            toast("Private tabs need a newer Android System WebView")
+            return
+        }
         val web = WebView(this)
         val tab = Tab(web)
+        tab.priv = private
         configure(tab)
         tabs.add(tab)
-        if (select) selectTab(tab)
-        if (url != null) loadIn(tab, url) else showStart(tab)
+        if (select) {
+            selectTab(tab)
+            if (url != null) loadIn(tab, url) else showStart(tab)
+        } else if (url != null) {
+            // Restored background tab: loads when you first switch to it
+            tab.pending = url
+            tab.url = url
+            tab.title = title
+        }
+    }
+
+    private fun deletePrivateProfile() {
+        if (!privateSupported()) return
+        if (tabs.any { it.priv }) return
+        try {
+            ProfileStore.getInstance().deleteProfile(PRIVATE_PROFILE)
+        } catch (_: Exception) {
+            // Still in use or never created; retried on next close/start
+        }
     }
 
     private fun selectTab(tab: Tab) {
@@ -419,6 +554,11 @@ class MainActivity : Activity() {
         tab.web.onResume()
         current = tab
         if (urlField.hasFocus()) urlField.clearFocus()
+        tab.pending?.let {
+            tab.pending = null
+            loadIn(tab, it)
+        }
+        hideFind()
         updateUi()
     }
 
@@ -429,6 +569,7 @@ class MainActivity : Activity() {
         (tab.web.parent as? ViewGroup)?.removeView(tab.web)
         tab.web.stopLoading()
         tab.web.destroy()
+        if (tab.priv) deletePrivateProfile()
         if (tabs.isEmpty()) {
             current = null
             newTab(null)
@@ -440,7 +581,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun tabLabel(t: Tab): String = when {
+    private fun tabLabel(t: Tab): String = (if (t.priv) "Private - " else "") + when {
         t.title.isNotBlank() -> t.title
         !isBlankUrl(t.url) -> displayUrl(t.url)
         else -> "New tab"
@@ -463,6 +604,8 @@ class MainActivity : Activity() {
         loadIn(tab, url)
         tab.web.requestFocus()
     }
+
+    private fun isHttpOk(host: String) = httpOk.contains(host) || prefs.isHttpAllowed(host)
 
     private fun isLocalHost(h: String?): Boolean {
         if (h == null) return false
@@ -496,7 +639,7 @@ class MainActivity : Activity() {
         tab.upgradedFrom = null
         if (prefs.httpsOnly && url.startsWith("http://")) {
             val host = Uri.parse(url).host
-            if (host != null && !isLocalHost(host) && !httpOk.contains(host)) {
+            if (host != null && !isLocalHost(host) && !isHttpOk(host)) {
                 tab.upgradedFrom = url
                 url = "https://" + url.removePrefix("http://")
             }
@@ -546,7 +689,9 @@ class MainActivity : Activity() {
 
     private fun configure(tab: Tab) {
         val web = tab.web
+        if (tab.priv) WebViewCompat.setProfile(web, PRIVATE_PROFILE)
         val s = web.settings
+        if (tab.priv) s.cacheMode = WebSettings.LOAD_NO_CACHE
         s.javaScriptEnabled = !prefs.blockJs
         s.domStorageEnabled = true
         s.allowFileAccess = false
@@ -555,7 +700,7 @@ class MainActivity : Activity() {
         s.allowFileAccessFromFileURLs = false
         @Suppress("DEPRECATION")
         s.allowUniversalAccessFromFileURLs = false
-        s.setGeolocationEnabled(false)
+        s.setGeolocationEnabled(true) // sites still have to ask, and you have to tap Allow
         s.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
         s.javaScriptCanOpenWindowsAutomatically = false
         s.setSupportMultipleWindows(false)
@@ -567,9 +712,15 @@ class MainActivity : Activity() {
         s.displayZoomControls = false
         applyDark(web)
 
-        val cm = CookieManager.getInstance()
+        val cm = if (tab.priv) {
+            ProfileStore.getInstance().getProfile(PRIVATE_PROFILE)?.cookieManager ?: CookieManager.getInstance()
+        } else CookieManager.getInstance()
         cm.setAcceptCookie(true)
         cm.setAcceptThirdPartyCookies(web, false)
+        web.setFindListener { ordinal, matches, _ ->
+            if (tab === current) findCount.text = if (matches == 0) "0" else "${ordinal + 1}/$matches"
+        }
+        refreshScripts(tab)
 
         web.setDownloadListener { url, ua, cd, mime, _ -> confirmDownload(url, ua, cd, mime) }
         web.setOnLongClickListener { onWebLongPress(web) }
@@ -590,7 +741,7 @@ class MainActivity : Activity() {
                         }
                         val host = url.host
                         if (prefs.httpsOnly && url.scheme == "http" && host != null &&
-                            !isLocalHost(host) && !httpOk.contains(host)
+                            !isLocalHost(host) && !isHttpOk(host)
                         ) {
                             tab.upgradedFrom = str
                             view.loadUrl("https://" + str.removePrefix("http://"))
@@ -615,7 +766,7 @@ class MainActivity : Activity() {
                 if (!prefs.blockAds) return null
                 val page = tab.pageHost
                 if (page != null && prefs.isAllowed(page)) return null
-                if (blocker.isBlocked(host)) {
+                if (blocker.isBlocked(host) || blocker.isBlockedUrl(request.url, page)) {
                     tab.blocked.incrementAndGet()
                     totalBlocked.incrementAndGet()
                     if (!uiPending.getAndSet(true)) ui.postDelayed(blockedRunnable, 400)
@@ -651,7 +802,11 @@ class MainActivity : Activity() {
                     AlertDialog.Builder(this@MainActivity)
                         .setTitle("No secure connection")
                         .setMessage("$host doesn't support HTTPS. Load it over plain HTTP? Anyone on the network could read or change what you see.")
-                        .setPositiveButton("Load over HTTP") { _, _ ->
+                        .setPositiveButton("Always for this site") { _, _ ->
+                            prefs.setHttpAllowed(host, true)
+                            view.loadUrl(up)
+                        }
+                        .setNeutralButton("Just once") { _, _ ->
                             httpOk.add(host)
                             view.loadUrl(up)
                         }
@@ -714,13 +869,16 @@ class MainActivity : Activity() {
                 hideCustomView()
             }
 
-            // Camera, mic and location are always denied: nothing in Feather ever prompts for them.
             override fun onPermissionRequest(request: PermissionRequest) {
-                request.deny()
+                askMedia(request)
+            }
+
+            override fun onPermissionRequestCanceled(request: PermissionRequest) {
+                if (pendingPermission === request) pendingPermission = null
             }
 
             override fun onGeolocationPermissionsShowPrompt(origin: String, callback: GeolocationPermissions.Callback) {
-                callback.invoke(origin, false, false)
+                askGeo(origin, callback)
             }
         }
     }
@@ -737,10 +895,108 @@ class MainActivity : Activity() {
 
     private fun injectCosmetic(tab: Tab, view: WebView) {
         if (!prefs.blockAds || prefs.blockJs) return
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) return // handled earlier by the document-start script
         val host = tab.pageHost
         if (host != null && prefs.isAllowed(host)) return
         if (isBlankUrl(tab.url)) return
         view.evaluateJavascript(AdBlocker.COSMETIC_JS, null)
+    }
+
+    /** (Re)installs the document-start script; call after anything that changes what it should do. */
+    private fun refreshScripts(tab: Tab) {
+        tab.scriptHandler?.remove()
+        tab.scriptHandler = null
+        if (!prefs.blockAds || prefs.blockJs) return
+        if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) return
+        try {
+            tab.scriptHandler = WebViewCompat.addDocumentStartJavaScript(
+                tab.web, AdBlocker.documentStartScript(prefs.allowedHosts()), setOf("*")
+            )
+        } catch (_: Exception) {
+        }
+    }
+
+    // ---------------------------------------------------------------- permission prompts
+
+    private fun askMedia(request: PermissionRequest) {
+        val cam = PermissionRequest.RESOURCE_VIDEO_CAPTURE in request.resources
+        val mic = PermissionRequest.RESOURCE_AUDIO_CAPTURE in request.resources
+        if (!cam && !mic) {
+            request.deny()
+            return
+        }
+        pendingPermission?.deny()
+        pendingPermission = null
+        val what = if (cam && mic) "camera and microphone" else if (cam) "camera" else "microphone"
+        val site = request.origin.host ?: request.origin.toString()
+        AlertDialog.Builder(this)
+            .setTitle("Allow $what?")
+            .setMessage("$site wants to use your $what. This only lasts while the page is open.")
+            .setPositiveButton("Allow") { _, _ ->
+                val need = ArrayList<String>()
+                if (cam && checkSelfPermission(android.Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED)
+                    need.add(android.Manifest.permission.CAMERA)
+                if (mic && checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED)
+                    need.add(android.Manifest.permission.RECORD_AUDIO)
+                if (need.isEmpty()) {
+                    finishMediaGrant(request)
+                } else {
+                    pendingPermission = request
+                    requestPermissions(need.toTypedArray(), REQ_MEDIA)
+                }
+            }
+            .setNegativeButton("Don't allow") { _, _ -> request.deny() }
+            .setOnCancelListener { request.deny() }
+            .show()
+    }
+
+    private fun finishMediaGrant(request: PermissionRequest) {
+        val camOk = checkSelfPermission(android.Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        val micOk = checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        val ok = request.resources.filter {
+            (it == PermissionRequest.RESOURCE_VIDEO_CAPTURE && camOk) || (it == PermissionRequest.RESOURCE_AUDIO_CAPTURE && micOk)
+        }
+        if (ok.isEmpty()) request.deny() else request.grant(ok.toTypedArray())
+    }
+
+    private fun askGeo(origin: String, callback: GeolocationPermissions.Callback) {
+        val site = Uri.parse(origin).host ?: origin
+        AlertDialog.Builder(this)
+            .setTitle("Share your location?")
+            .setMessage("$site wants to know where you are.")
+            .setPositiveButton("Allow") { _, _ ->
+                if (checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+                    callback.invoke(origin, true, false)
+                } else {
+                    pendingGeo = origin to callback
+                    requestPermissions(
+                        arrayOf(android.Manifest.permission.ACCESS_FINE_LOCATION, android.Manifest.permission.ACCESS_COARSE_LOCATION),
+                        REQ_GEO
+                    )
+                }
+            }
+            .setNegativeButton("Don't allow") { _, _ -> callback.invoke(origin, false, false) }
+            .setOnCancelListener { callback.invoke(origin, false, false) }
+            .show()
+    }
+
+    // ---------------------------------------------------------------- find in page
+
+    private fun showFind() {
+        findRow.visibility = View.VISIBLE
+        findField.requestFocus()
+        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        imm.showSoftInput(findField, InputMethodManager.SHOW_IMPLICIT)
+    }
+
+    private fun hideFind() {
+        if (findRow.visibility != View.VISIBLE) return
+        findRow.visibility = View.GONE
+        findField.setText("")
+        findCount.text = ""
+        current?.web?.clearMatches()
+        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        imm.hideSoftInputFromWindow(findField.windowToken, 0)
     }
 
     // ---------------------------------------------------------------- fullscreen video
@@ -951,6 +1207,8 @@ class MainActivity : Activity() {
         val items = ArrayList<String>()
         val actions = ArrayList<() -> Unit>()
         items.add("New tab"); actions.add { newTab(null); focusUrlBar() }
+        items.add("New private tab"); actions.add { newTab(null, private = true); if (current?.priv == true) focusUrlBar() }
+        if (hasPage) { items.add("Find in page"); actions.add { showFind() } }
         if (hasPage) {
             items.add("Bookmark this page"); actions.add {
                 val l = prefs.bookmarks()
@@ -977,6 +1235,10 @@ class MainActivity : Activity() {
             items.add(if (siteOn) "Turn off ad blocking for this site" else "Turn on ad blocking for this site")
             actions.add { toggleSite(tab, host) }
         }
+        items.add("Downloads"); actions.add {
+            try { startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)) } catch (_: ActivityNotFoundException) { toast("No downloads app found") }
+        }
+        items.add("HTTP exceptions"); actions.add { showHttpExceptions() }
         items.add("Settings"); actions.add { showSettings() }
 
         AlertDialog.Builder(this)
@@ -986,8 +1248,24 @@ class MainActivity : Activity() {
 
     private fun toggleSite(tab: Tab, host: String) {
         prefs.setAllowed(host, !prefs.isAllowed(host))
+        for (t in tabs) refreshScripts(t)
         tab.web.reload()
         updateUi()
+    }
+
+    private fun showHttpExceptions() {
+        val list = prefs.httpAllowed()
+        val rows = list.map { Row(it, "Always loads over plain HTTP") }.toMutableList()
+        showList(
+            "HTTP exceptions", rows,
+            onPick = { },
+            onRemove = { idx ->
+                prefs.setHttpAllowed(list[idx], false)
+                list.removeAt(idx)
+                rows.removeAt(idx)
+            },
+            emptyText = "No sites. When a site has no HTTPS you can choose \"Always for this site\" and it will show up here."
+        )
     }
 
     private fun showShieldDialog() {
@@ -1016,10 +1294,12 @@ class MainActivity : Activity() {
             "Strip tracking parameters from links",
             "Block JavaScript (strict, breaks many sites)",
             "Dark pages (when system is dark)",
-            "Clear all data when Feather closes"
+            "Clear all data when Feather closes",
+            "Restore tabs on start"
         )
         val checked = booleanArrayOf(
-            prefs.blockAds, prefs.httpsOnly, prefs.stripTracking, prefs.blockJs, prefs.darkPages, prefs.clearOnExit
+            prefs.blockAds, prefs.httpsOnly, prefs.stripTracking, prefs.blockJs, prefs.darkPages, prefs.clearOnExit,
+            prefs.restoreTabs
         )
         AlertDialog.Builder(this)
             .setTitle("Settings")
@@ -1031,10 +1311,12 @@ class MainActivity : Activity() {
                     3 -> prefs.blockJs = on
                     4 -> prefs.darkPages = on
                     5 -> { prefs.clearOnExit = on; prefs.pendingClear = on }
+                    6 -> prefs.restoreTabs = on
                 }
                 for (t in tabs) {
                     t.web.settings.javaScriptEnabled = !prefs.blockJs
                     applyDark(t.web)
+                    refreshScripts(t)
                 }
                 updateUi()
             }
@@ -1076,6 +1358,9 @@ class MainActivity : Activity() {
 
     companion object {
         private const val REQ_FILE = 1001
+        private const val REQ_MEDIA = 1002
+        private const val REQ_GEO = 1003
+        private const val PRIVATE_PROFILE = "private"
         private const val ACCENT = 0xFF4F8CFF.toInt()
         private val TRACKING_PARAMS = setOf(
             "fbclid", "gclid", "dclid", "gbraid", "wbraid", "msclkid", "mc_eid", "mc_cid",
