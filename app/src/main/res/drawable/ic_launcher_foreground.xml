@@ -1,0 +1,9 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <!-- Feather: a leaf-like quill with a spine -->
+    <path android:fillColor="#FFFFFFFF"
+        android:pathData="M72,30C56,32 40,44 36,62c-1,5 -1,9 0,13l-6,8 3,2 6,-8c4,1 8,1 13,0 18,-4 29,-20 30,-36 0,-4 -1,-8 -4,-11z" />
+    <path android:fillColor="#FF4F8CFF"
+        android:pathData="M42,70L66,44l2,2L44,72z" />
+</vector>
