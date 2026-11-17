@@ -37,6 +37,11 @@ class Prefs(context: Context) {
         get() = sp.getBoolean("extra_filters", true)
         set(v) = sp.edit().putBoolean("extra_filters", v).apply()
 
+    /** On YouTube: let ad pings through and skip the heavy page filters; ads are still stripped by script. */
+    var ytGentle: Boolean
+        get() = sp.getBoolean("yt_gentle", true)
+        set(v) = sp.edit().putBoolean("yt_gentle", v).apply()
+
     var cookieBanners: Boolean
         get() = sp.getBoolean("cookie_banners", true)
         set(v) = sp.edit().putBoolean("cookie_banners", v).apply()

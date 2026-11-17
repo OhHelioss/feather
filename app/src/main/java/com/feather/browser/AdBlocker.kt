@@ -55,6 +55,8 @@ class AdBlocker(context: Context) {
     /** Turns EasyList-style rules and cosmetic selectors on or off (the host list always applies). */
     @Volatile var extraEnabled: Boolean = true
 
+    @Volatile var youtubeGentle: Boolean = true
+
     /** Called on the loader thread when everything is ready. */
     @Volatile var onLoaded: (() -> Unit)? = null
 
@@ -149,14 +151,15 @@ class AdBlocker(context: Context) {
 
     fun shouldBlock(url: Uri, pageHost: String?): Boolean {
         val host = url.host?.lowercase() ?: return false
-        if (isYoutubeAdEndpoint(url)) return true
+        if (isYoutubeAdEndpoint(url)) return !youtubeGentle
+        val ytPage = pageHost != null && (pageHost == "youtube.com" || pageHost.endsWith(".youtube.com"))
         val thirdParty = pageHost != null && registrable(host) != registrable(pageHost.lowercase())
         var blocked = hostListed(host)
         if (!blocked && thirdParty) {
             val path = (url.encodedPath ?: "").lowercase()
             for (p in PATH_PATTERNS) if (path.contains(p)) { blocked = true; break }
         }
-        if (!blocked && extraEnabled && blockRules.isNotEmpty()) blocked = ruleMatches(blockRules, host, url, thirdParty)
+        if (!blocked && extraEnabled && !(youtubeGentle && ytPage) && blockRules.isNotEmpty()) blocked = ruleMatches(blockRules, host, url, thirdParty)
         if (blocked && extraEnabled && allowRules.isNotEmpty() && ruleMatches(allowRules, host, url, thirdParty)) return false
         return blocked
     }
@@ -271,7 +274,7 @@ class AdBlocker(context: Context) {
          * hides and declines cookie banners, and on YouTube removes ad data from player responses and
          * skips any ad that still appears. Sites in [offHosts] are left alone.
          */
-        fun documentStartScript(offHosts: Collection<String>, genericCss: String, cookieBanners: Boolean): String {
+        fun documentStartScript(offHosts: Collection<String>, genericCss: String, cookieBanners: Boolean, ytGentle: Boolean): String {
             val off = JSONArray(offHosts).toString()
             val generic = JSONObject.quote(genericCss)
             val cookies = if (cookieBanners) COOKIE_JS else ""
@@ -279,9 +282,9 @@ class AdBlocker(context: Context) {
 (function(){try{
 var h=location.hostname;
 if(($off).indexOf(h)>-1)return;
-var css='$COSMETIC_SELECTORS{display:none!important}';
-css+=$generic;
 var yt=(h==='youtube.com'||h.endsWith('.youtube.com'));
+var css='$COSMETIC_SELECTORS{display:none!important}';
+if(!(yt&&$ytGentle))css+=$generic;
 if(yt)css+='$YT_SELECTORS{display:none!important}';
 function addCss(){if(document.getElementById('__fb_css')||!document.documentElement)return;
 var s=document.createElement('style');s.id='__fb_css';s.textContent=css;(document.head||document.documentElement).appendChild(s);}

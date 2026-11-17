@@ -2,6 +2,7 @@ package com.feather.browser
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.app.Dialog
 import android.app.DownloadManager
 import android.app.KeyguardManager
 import android.content.ActivityNotFoundException
@@ -16,6 +17,8 @@ import android.content.res.ColorStateList
 import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.drawable.ColorDrawable
 import android.graphics.Paint
 import android.graphics.drawable.Icon
 import android.hardware.biometrics.BiometricManager
@@ -37,6 +40,7 @@ import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.Window
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
@@ -154,6 +158,7 @@ class MainActivity : Activity() {
         prefs = Prefs(this)
         blocker = AdBlocker(this)
         blocker.extraEnabled = prefs.extraFilters
+        blocker.youtubeGentle = prefs.ytGentle
         blocker.onLoaded = { ui.post { for (t in tabs) refreshScripts(t) } }
         blocker.start()
         needLock = prefs.appLock
@@ -987,7 +992,8 @@ class MainActivity : Activity() {
         val host = tab.pageHost
         if (host != null && prefs.isAllowed(host)) return
         if (isBlankUrl(tab.url) || host == null) return
-        val css = blocker.domainCss(host)
+        val ytHost = host == "youtube.com" || host.endsWith(".youtube.com")
+        val css = if (ytHost && prefs.ytGentle) "" else blocker.domainCss(host)
         if (css.isNotEmpty()) {
             view.evaluateJavascript(
                 "(function(){var s=document.getElementById('__fb_dom');if(!s){s=document.createElement('style');" +
@@ -1009,7 +1015,7 @@ class MainActivity : Activity() {
         try {
             val generic = if (prefs.extraFilters) blocker.genericCss else ""
             tab.scriptHandler = WebViewCompat.addDocumentStartJavaScript(
-                tab.web, AdBlocker.documentStartScript(prefs.allowedHosts(), generic, prefs.cookieBanners), setOf("*")
+                tab.web, AdBlocker.documentStartScript(prefs.allowedHosts(), generic, prefs.cookieBanners, prefs.ytGentle), setOf("*")
             )
         } catch (_: Exception) {
         }
@@ -1430,16 +1436,93 @@ class MainActivity : Activity() {
     private fun showMenu() {
         val tab = current ?: return
         val host = tab.pageHost
-        val siteOn = host != null && !prefs.isAllowed(host)
         val hasPage = !isBlankUrl(tab.url)
-        val items = ArrayList<String>()
-        val actions = ArrayList<() -> Unit>()
-        items.add("New tab"); actions.add { newTab(null); focusUrlBar() }
-        items.add("New private tab"); actions.add { newTab(null, private = true); if (current?.priv == true) focusUrlBar() }
-        if (hasPage) { items.add("Find in page"); actions.add { showFind() } }
-        if (hasPage) { items.add("Reader view"); actions.add { showReader() } }
+        val dlg = Dialog(this)
+        dlg.requestWindowFeature(Window.FEATURE_NO_TITLE)
+
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        col.setPadding(dp(14), dp(18), dp(14), dp(28))
+        val sheet = GradientDrawable()
+        sheet.setColor(if (night) 0xFF1F1F26.toInt() else 0xFFFFFFFF.toInt())
+        val r = dp(24).toFloat()
+        sheet.cornerRadii = floatArrayOf(r, r, r, r, 0f, 0f, 0f, 0f)
+        col.background = sheet
+
+        fun run(a: () -> Unit) { dlg.dismiss(); a() }
+
+        fun tile(label: String, a: () -> Unit): View {
+            val t = TextView(this)
+            t.text = label
+            t.textSize = 13f
+            t.gravity = Gravity.CENTER
+            t.setTextColor(textColor)
+            val b = GradientDrawable()
+            b.cornerRadius = dp(14).toFloat()
+            b.setColor(fieldColor)
+            t.background = b
+            t.setOnClickListener { run(a) }
+            return t
+        }
+
+        fun tileRow(vararg tiles: Pair<String, () -> Unit>) {
+            val row = LinearLayout(this)
+            for ((label, a) in tiles) {
+                val lp = LinearLayout.LayoutParams(0, dp(60), 1f)
+                lp.setMargins(dp(4), dp(4), dp(4), dp(4))
+                row.addView(tile(label, a), lp)
+            }
+            col.addView(row)
+        }
+
+        fun section(title: String) {
+            val t = TextView(this)
+            t.text = title.uppercase()
+            t.textSize = 11f
+            t.letterSpacing = 0.08f
+            t.setTextColor(subtleColor)
+            t.setPadding(dp(8), dp(16), dp(8), dp(2))
+            col.addView(t)
+        }
+
+        fun row(label: String, value: String? = null, a: () -> Unit) {
+            val line = LinearLayout(this)
+            line.gravity = Gravity.CENTER_VERTICAL
+            line.setPadding(dp(8), dp(13), dp(8), dp(13))
+            val tv = TypedValue()
+            theme.resolveAttribute(android.R.attr.selectableItemBackground, tv, true)
+            line.setBackgroundResource(tv.resourceId)
+            val l = TextView(this)
+            l.text = label
+            l.textSize = 16f
+            l.setTextColor(textColor)
+            line.addView(l, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            if (value != null) {
+                val v = TextView(this)
+                v.text = value
+                v.textSize = 14f
+                v.setTextColor(subtleColor)
+                line.addView(v)
+            }
+            line.setOnClickListener { run(a) }
+            col.addView(line)
+        }
+
+        tileRow(
+            "New tab" to { newTab(null); focusUrlBar() },
+            "Private tab" to { newTab(null, private = true); if (current?.priv == true) focusUrlBar() },
+            "Bookmarks" to { showBookmarks() },
+            "Downloads" to {
+                try { startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)) }
+                catch (_: ActivityNotFoundException) { toast("No downloads app found") }
+            }
+        )
+
         if (hasPage) {
-            items.add("Bookmark this page"); actions.add {
+            section("This page")
+            row("Find in page") { showFind() }
+            row("Reader view") { showReader() }
+            row("Bookmark this page") {
                 val l = prefs.bookmarks()
                 if (l.none { it.second == tab.url }) {
                     l.add(0, tabLabel(tab) to tab.url)
@@ -1447,32 +1530,32 @@ class MainActivity : Activity() {
                 }
                 toast("Bookmarked")
             }
+            row("Share link") { share(tab.url) }
+            row("Copy link") { copy(tab.url) }
+            row("Add to home screen") { pinShortcut(tab) }
         }
-        items.add("Bookmarks"); actions.add { showBookmarks() }
-        if (hasPage) {
-            items.add("Add to home screen"); actions.add { pinShortcut(tab) }
-            items.add("Share link"); actions.add { share(tab.url) }
-            items.add("Copy link"); actions.add { copy(tab.url) }
-        }
-        items.add(if (tab.desktop) "Mobile site" else "Desktop site"); actions.add {
+
+        section("View")
+        row("Desktop site", if (tab.desktop) "On" else "Off") {
             tab.desktop = !tab.desktop
             applySiteSettings(tab, host)
             if (hasPage) tab.web.reload()
         }
-        if (hasPage && host != null) {
-            items.add(if (siteOn) "Turn off ad blocking for this site" else "Turn on ad blocking for this site")
-            actions.add { toggleSite(tab, host) }
-            items.add("Site settings"); actions.add { showSiteSettings(tab) }
-        }
-        items.add("Downloads"); actions.add {
-            try { startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)) } catch (_: ActivityNotFoundException) { toast("No downloads app found") }
-        }
-        items.add("HTTP exceptions"); actions.add { showHttpExceptions() }
-        items.add("Settings"); actions.add { showSettings() }
+        if (hasPage && host != null) row("Site settings", host.removePrefix("www.")) { showSiteSettings(tab) }
 
-        AlertDialog.Builder(this)
-            .setItems(items.toTypedArray()) { _, which -> actions[which]() }
-            .show()
+        section("Browser")
+        row("Settings") { showSettings() }
+        row("HTTP exceptions") { showHttpExceptions() }
+
+        val scroll = ScrollView(this)
+        scroll.addView(col)
+        dlg.setContentView(scroll)
+        dlg.window?.apply {
+            setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+            setGravity(Gravity.BOTTOM)
+            setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        }
+        dlg.show()
     }
 
     private fun toggleSite(tab: Tab, host: String) {
@@ -1699,11 +1782,12 @@ class MainActivity : Activity() {
             "Restore tabs on start",
             "Extra filter lists (EasyList, EasyPrivacy, uBO)",
             "Hide and decline cookie banners",
-            "Lock Feather (fingerprint or screen lock)"
+            "Lock Feather (fingerprint or screen lock)",
+            "YouTube gentle mode (fewer blocked requests, faster start)"
         )
         val checked = booleanArrayOf(
             prefs.blockAds, prefs.httpsOnly, prefs.stripTracking, prefs.blockJs, prefs.darkPages, prefs.clearOnExit,
-            prefs.restoreTabs, prefs.extraFilters, prefs.cookieBanners, prefs.appLock
+            prefs.restoreTabs, prefs.extraFilters, prefs.cookieBanners, prefs.appLock, prefs.ytGentle
         )
         AlertDialog.Builder(this)
             .setTitle("Settings")
@@ -1718,6 +1802,7 @@ class MainActivity : Activity() {
                     6 -> prefs.restoreTabs = on
                     7 -> { prefs.extraFilters = on; blocker.extraEnabled = on }
                     8 -> prefs.cookieBanners = on
+                    10 -> { prefs.ytGentle = on; blocker.youtubeGentle = on }
                     9 -> {
                         val km = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
                         if (on && !km.isDeviceSecure) {
