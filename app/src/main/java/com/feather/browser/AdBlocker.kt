@@ -274,7 +274,7 @@ class AdBlocker(context: Context) {
          * hides and declines cookie banners, and on YouTube removes ad data from player responses and
          * skips any ad that still appears. Sites in [offHosts] are left alone.
          */
-        fun documentStartScript(offHosts: Collection<String>, genericCss: String, cookieBanners: Boolean, ytGentle: Boolean): String {
+        fun documentStartScript(offHosts: Collection<String>, genericCss: String, cookieBanners: Boolean, ytGentle: Boolean, ytAds: Boolean): String {
             val off = JSONArray(offHosts).toString()
             val generic = JSONObject.quote(genericCss)
             val cookies = if (cookieBanners) COOKIE_JS else ""
@@ -282,9 +282,10 @@ class AdBlocker(context: Context) {
 (function(){try{
 var h=location.hostname;
 if(($off).indexOf(h)>-1)return;
-var yt=(h==='youtube.com'||h.endsWith('.youtube.com'));
+var ytSite=(h==='youtube.com'||h.endsWith('.youtube.com'));
+var yt=ytSite&&$ytAds;
 var css='$COSMETIC_SELECTORS{display:none!important}';
-if(!(yt&&$ytGentle))css+=$generic;
+if(!(ytSite&&$ytGentle))css+=$generic;
 if(yt)css+='$YT_SELECTORS{display:none!important}';
 function addCss(){if(document.getElementById('__fb_css')||!document.documentElement)return;
 var s=document.createElement('style');s.id='__fb_css';s.textContent=css;(document.head||document.documentElement).appendChild(s);}

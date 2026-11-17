@@ -42,6 +42,11 @@ class Prefs(context: Context) {
         get() = sp.getBoolean("yt_gentle", true)
         set(v) = sp.edit().putBoolean("yt_gentle", v).apply()
 
+    /** The YouTube-specific ad removal script. Off = Feather adds nothing to YouTube pages. */
+    var ytAdRemoval: Boolean
+        get() = sp.getBoolean("yt_ad_removal", true)
+        set(v) = sp.edit().putBoolean("yt_ad_removal", v).apply()
+
     var cookieBanners: Boolean
         get() = sp.getBoolean("cookie_banners", true)
         set(v) = sp.edit().putBoolean("cookie_banners", v).apply()

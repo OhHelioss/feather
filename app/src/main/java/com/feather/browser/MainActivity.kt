@@ -1015,7 +1015,7 @@ class MainActivity : Activity() {
         try {
             val generic = if (prefs.extraFilters) blocker.genericCss else ""
             tab.scriptHandler = WebViewCompat.addDocumentStartJavaScript(
-                tab.web, AdBlocker.documentStartScript(prefs.allowedHosts(), generic, prefs.cookieBanners, prefs.ytGentle), setOf("*")
+                tab.web, AdBlocker.documentStartScript(prefs.allowedHosts(), generic, prefs.cookieBanners, prefs.ytGentle, prefs.ytAdRemoval), setOf("*")
             )
         } catch (_: Exception) {
         }
@@ -1783,11 +1783,12 @@ class MainActivity : Activity() {
             "Extra filter lists (EasyList, EasyPrivacy, uBO)",
             "Hide and decline cookie banners",
             "Lock Feather (fingerprint or screen lock)",
-            "YouTube gentle mode (fewer blocked requests, faster start)"
+            "YouTube gentle mode (fewer blocked requests, faster start)",
+            "YouTube ad removal script (turn off to test for slow starts)"
         )
         val checked = booleanArrayOf(
             prefs.blockAds, prefs.httpsOnly, prefs.stripTracking, prefs.blockJs, prefs.darkPages, prefs.clearOnExit,
-            prefs.restoreTabs, prefs.extraFilters, prefs.cookieBanners, prefs.appLock, prefs.ytGentle
+            prefs.restoreTabs, prefs.extraFilters, prefs.cookieBanners, prefs.appLock, prefs.ytGentle, prefs.ytAdRemoval
         )
         AlertDialog.Builder(this)
             .setTitle("Settings")
@@ -1803,6 +1804,7 @@ class MainActivity : Activity() {
                     7 -> { prefs.extraFilters = on; blocker.extraEnabled = on }
                     8 -> prefs.cookieBanners = on
                     10 -> { prefs.ytGentle = on; blocker.youtubeGentle = on }
+                    11 -> prefs.ytAdRemoval = on
                     9 -> {
                         val km = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
                         if (on && !km.isDeviceSecure) {
